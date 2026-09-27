@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -31,6 +31,24 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  createSurface as herdrCreateSurface,
+  createSurfaceSplit as herdrCreateSurfaceSplit,
+  sendCommand as herdrSendCommand,
+  sendLongCommand as herdrSendLongCommand,
+  readScreen as herdrReadScreen,
+  readScreenAsync as herdrReadScreenAsync,
+  closeSurface as herdrCloseSurface,
+  pollForExit as herdrPollForExit,
+  __setHerdrExecutorForTest__,
+  __setHerdrAvailableForTest__,
+} from "../pi-extension/subagents/herdr.ts";
+import {
+  resolveTerminalBackend,
+  detectBackendFromSurface,
+  createSurface as terminalCreateSurface,
+  sendCommand as terminalSendCommand,
+} from "../pi-extension/subagents/terminal.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -1206,13 +1224,39 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("getToolExtensionPath maps custom tools and skips built-ins", () => {
-    assert.equal(testApi.getToolExtensionPath("read"), undefined);
-    assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
-    assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
-    // Spawning tools are registered by this extension itself.
-    assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  it("getToolExtensionPath maps custom tools and skips built-ins", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const extensionDir = join(globalDir, "extensions", "web-search");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(join(extensionDir, "index.ts"), "export default () => {};");
+      assert.equal(testApi.getToolExtensionPath("read"), undefined);
+      assert.equal(testApi.getToolExtensionPath("bash"), undefined);
+      assert.equal(testApi.getToolExtensionPath("web_search"), join(extensionDir, "index.ts"));
+      assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
+      assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+    });
+  });
+
+  it("resolves Pi-managed pi-web-access for restricted children", async () => {
+    await withIsolatedAgentEnv(({ globalDir }) => {
+      const webTools = ["web_search", "fetch_content", "get_search_content", "source_check"];
+      for (const tool of webTools) assert.equal(testApi.getToolExtensionPath(tool), undefined);
+      const extensionDir = join(globalDir, "npm", "node_modules", "pi-web-access");
+      mkdirSync(extensionDir, { recursive: true });
+      const entry = join(extensionDir, "index.ts");
+      writeFileSync(entry, "export default () => {};");
+      for (const tool of webTools) assert.equal(testApi.getToolExtensionPath(tool), entry);
+      assert.equal(testApi.getToolExtensionPath("web_fetch"), undefined);
+    });
+  });
+
+  it("bundled profiles use the configured Pi model and supported web tool names", () => {
+    for (const name of ["scout", "researcher", "worker"]) {
+      const defs = testApi.loadAgentDefaults(name)!;
+      assert.equal(defs.model, undefined);
+      assert.ok(!defs.tools?.includes("web_fetch"));
+    }
+    assert.ok(testApi.loadAgentDefaults("researcher")!.tools?.includes("fetch_content"));
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -1318,6 +1362,18 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applies profile thinking even when using Pi's configured default model", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(parts, {
+        agent: "scout", toolAllowlist: null, model: null, thinking: "low",
+        systemPromptMode: null, identity: null, spawnable: null,
+        autoExit: true, cwd: null, agentDir: null,
+      }, { artifactDir: d, name: "scout" });
+      assert.deepEqual(parts, ["--thinking", "'low'"]);
     });
   });
 
@@ -2673,6 +2729,430 @@ describe("tmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+});
+
+describe("herdr.ts", () => {
+  // Every test below overrides both the CLI executor and the availability
+  // gate, so these run deterministically regardless of whether the sandbox
+  // running them actually has HERDR_ENV set or a real `herdr` binary on PATH.
+  function withHerdrCli(
+    sync: Parameters<typeof __setHerdrExecutorForTest__>[0],
+    fn: () => void | Promise<void>,
+  ) {
+    const restoreExec = __setHerdrExecutorForTest__(sync);
+    const restoreAvail = __setHerdrAvailableForTest__(true);
+    return Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        restoreExec();
+        restoreAvail();
+      });
+  }
+
+  // Herdr puts success envelopes on stdout and error envelopes on stderr —
+  // confirmed empirically (see herdr.ts) — so this fixture builder routes
+  // to the right stream based on the exit code, matching real CLI behavior.
+  function jsonResult(obj: unknown, exitCode = 0) {
+    const json = JSON.stringify(obj);
+    return exitCode === 0
+      ? { stdout: json, stderr: "", exitCode }
+      : { stdout: "", stderr: json, exitCode };
+  }
+
+  describe("createSurfaceSplit", () => {
+    it("parses the pane id out of the split JSON envelope and passes --no-focus", async () => {
+      let capturedArgs: string[] | undefined;
+      await withHerdrCli((args) => {
+        capturedArgs = args;
+        return jsonResult({ result: { pane: { pane_id: "w1:p9" } } });
+      }, () => {
+        const pane = herdrCreateSurfaceSplit("worker", "right", "w1:p1");
+        assert.equal(pane, "w1:p9");
+      });
+
+      assert.ok(capturedArgs, "expected the CLI to be invoked");
+      assert.deepEqual(capturedArgs, ["pane", "split", "--pane", "w1:p1", "--direction", "right", "--no-focus"]);
+    });
+
+    it("rejects left/up directions explicitly instead of guessing a fallback", async () => {
+      await withHerdrCli(() => {
+        throw new Error("CLI should not be invoked for an unsupported direction");
+      }, () => {
+        assert.throws(
+          () => herdrCreateSurfaceSplit("worker", "left", "w1:p1"),
+          /only supports "right" and "down"/,
+        );
+        assert.throws(
+          () => herdrCreateSurfaceSplit("worker", "up", "w1:p1"),
+          /only supports "right" and "down"/,
+        );
+      });
+    });
+
+    it("throws when there is no anchor pane to split from", async () => {
+      const prevPane = process.env.HERDR_PANE_ID;
+      delete process.env.HERDR_PANE_ID;
+      try {
+        await withHerdrCli(() => {
+          throw new Error("CLI should not be invoked without an anchor pane");
+        }, () => {
+          assert.throws(() => herdrCreateSurfaceSplit("worker", "right"), /No Herdr anchor pane/);
+        });
+      } finally {
+        restoreEnvVar("HERDR_PANE_ID", prevPane);
+      }
+    });
+
+    it("surfaces the JSON error envelope's message and code on failure", async () => {
+      await withHerdrCli(
+        () => jsonResult({ error: { code: "pane_not_found", message: "pane w1:p1 not found" } }, 1),
+        () => {
+          assert.throws(
+            () => herdrCreateSurfaceSplit("worker", "down", "w1:p1"),
+            /pane w1:p1 not found \(pane_not_found\)/,
+          );
+        },
+      );
+    });
+
+    it("throws a descriptive error on non-JSON stderr for a failing call", () => {
+      return withHerdrCli(
+        () => ({ stdout: "", stderr: "not json at all", exitCode: 1 }),
+        () => {
+          assert.throws(() => herdrCreateSurfaceSplit("worker", "right", "w1:p1"), /non-JSON stderr/);
+        },
+      );
+    });
+
+    it("throws a descriptive error on non-JSON stdout for a successful exit code", () => {
+      return withHerdrCli(
+        () => ({ stdout: "not json at all", stderr: "", exitCode: 0 }),
+        () => {
+          assert.throws(() => herdrCreateSurfaceSplit("worker", "right", "w1:p1"), /returned non-JSON output/);
+        },
+      );
+    });
+  });
+
+  describe("createSurface", () => {
+    it("splits right off the caller's own pane (HERDR_PANE_ID)", async () => {
+      const prevPane = process.env.HERDR_PANE_ID;
+      process.env.HERDR_PANE_ID = "w1:p1";
+      try {
+        let capturedArgs: string[] | undefined;
+        await withHerdrCli((args) => {
+          capturedArgs = args;
+          return jsonResult({ result: { pane: { pane_id: "w1:p2" } } });
+        }, () => {
+          const pane = herdrCreateSurface("worker");
+          assert.equal(pane, "w1:p2");
+        });
+        assert.deepEqual(capturedArgs, ["pane", "split", "--pane", "w1:p1", "--direction", "right", "--no-focus"]);
+      } finally {
+        restoreEnvVar("HERDR_PANE_ID", prevPane);
+      }
+    });
+  });
+
+  describe("sendCommand", () => {
+    it("runs the literal command via `pane run` (atomic text+Enter — no separate Enter step)", async () => {
+      let capturedArgs: string[] | undefined;
+      await withHerdrCli((args) => {
+        capturedArgs = args;
+        return { stdout: "", exitCode: 0 }; // success prints nothing
+      }, () => {
+        herdrSendCommand("w1:p2", 'echo "hi"');
+      });
+      assert.deepEqual(capturedArgs, ["pane", "run", "w1:p2", 'echo "hi"']);
+    });
+
+    it("throws the JSON error message when the target pane is missing", async () => {
+      await withHerdrCli(
+        () => jsonResult({ error: { code: "pane_not_found", message: "pane w1:p2 not found" } }, 1),
+        () => {
+          assert.throws(() => herdrSendCommand("w1:p2", "echo hi"), /pane w1:p2 not found/);
+        },
+      );
+    });
+  });
+
+  describe("sendLongCommand", () => {
+    it("stages a script file and runs `bash <path>` via pane run", async () => {
+      withTempDir((dir) => {
+        const scriptPath = join(dir, "cmd.sh");
+        let capturedArgs: string[] | undefined;
+        return withHerdrCli((args) => {
+          capturedArgs = args;
+          return { stdout: "", exitCode: 0 };
+        }, () => {
+          const returnedPath = herdrSendLongCommand("w1:p2", "echo hello", { scriptPath });
+          assert.equal(returnedPath, scriptPath);
+          assert.ok(existsSync(scriptPath));
+          const content = readFileSync(scriptPath, "utf8");
+          assert.match(content, /^#!\/bin\/bash/);
+          assert.match(content, /echo hello/);
+          assert.deepEqual(capturedArgs, ["pane", "run", "w1:p2", `bash ${shellEscape(scriptPath)}`]);
+        });
+      });
+    });
+  });
+
+  describe("readScreen / readScreenAsync", () => {
+    it("returns raw pane text on success (not a JSON envelope)", async () => {
+      let capturedArgs: string[] | undefined;
+      await withHerdrCli((args) => {
+        capturedArgs = args;
+        return { stdout: "line one\nline two\n", exitCode: 0 };
+      }, () => {
+        const screen = herdrReadScreen("w1:p2", 10);
+        assert.equal(screen, "line one\nline two\n");
+      });
+      assert.deepEqual(capturedArgs, [
+        "pane", "read", "w1:p2", "--source", "recent", "--lines", "10", "--format", "text",
+      ]);
+    });
+
+    it("readScreenAsync surfaces the JSON error message on failure", async () => {
+      const restoreExec = __setHerdrExecutorForTest__(
+        () => { throw new Error("sync path should not be used"); },
+        async () => jsonResult({ error: { code: "pane_not_found", message: "pane w1:p2 not found" } }, 1),
+      );
+      const restoreAvail = __setHerdrAvailableForTest__(true);
+      try {
+        await assert.rejects(herdrReadScreenAsync("w1:p2", 5), /pane w1:p2 not found/);
+      } finally {
+        restoreExec();
+        restoreAvail();
+      }
+    });
+  });
+
+  describe("closeSurface", () => {
+    it("closes the given pane", async () => {
+      let capturedArgs: string[] | undefined;
+      await withHerdrCli((args) => {
+        capturedArgs = args;
+        return jsonResult({ result: { type: "ok" } });
+      }, () => {
+        herdrCloseSurface("w1:p2");
+      });
+      assert.deepEqual(capturedArgs, ["pane", "close", "w1:p2"]);
+    });
+
+    it("surfaces a close failure instead of swallowing it", async () => {
+      await withHerdrCli(
+        () => jsonResult({ error: { code: "pane_not_found", message: "pane w1:p2 not found" } }, 1),
+        () => {
+          assert.throws(() => herdrCloseSurface("w1:p2"), /pane w1:p2 not found/);
+        },
+      );
+    });
+  });
+
+  describe("pollForExit", () => {
+    it("detects the terminal sentinel via readScreenAsync (crash-detection slow path)", async () => {
+      const restoreExec = __setHerdrExecutorForTest__(
+        () => { throw new Error("sync path should not be used"); },
+        async () => ({ stdout: "some output\n__SUBAGENT_DONE_0__\n", exitCode: 0 }),
+      );
+      const restoreAvail = __setHerdrAvailableForTest__(true);
+      try {
+        const controller = new AbortController();
+        const result = await herdrPollForExit("w1:p2", controller.signal, { interval: 20 });
+        assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      } finally {
+        restoreExec();
+        restoreAvail();
+      }
+    });
+
+    it("detects a .exit sidecar error before the sentinel ever appears", async () => {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "session.jsonl");
+        writeFileSync(sessionFile, "");
+        writeFileSync(
+          `${sessionFile}.exit`,
+          JSON.stringify({ type: "error", errorMessage: "provider overloaded" }),
+        );
+
+        const restoreExec = __setHerdrExecutorForTest__(
+          () => { throw new Error("sync path should not be used"); },
+          async () => ({ stdout: "still running, no sentinel yet\n", exitCode: 0 }),
+        );
+        const restoreAvail = __setHerdrAvailableForTest__(true);
+        return (async () => {
+          try {
+            const controller = new AbortController();
+            const result = await herdrPollForExit("w1:p2", controller.signal, {
+              interval: 20,
+              sessionFile,
+            });
+            assert.deepEqual(result, {
+              reason: "error",
+              exitCode: 1,
+              errorMessage: "provider overloaded",
+            });
+          } finally {
+            restoreExec();
+            restoreAvail();
+          }
+        })();
+      });
+    });
+
+    it("propagates cancellation via the abort signal instead of hanging", async () => {
+      const restoreExec = __setHerdrExecutorForTest__(
+        () => { throw new Error("sync path should not be used"); },
+        async () => ({ stdout: "still starting up\n", exitCode: 0 }),
+      );
+      const restoreAvail = __setHerdrAvailableForTest__(true);
+      try {
+        const controller = new AbortController();
+        const pending = herdrPollForExit("w1:p2", controller.signal, { interval: 50 });
+        controller.abort();
+        await assert.rejects(pending, /Aborted/);
+      } finally {
+        restoreExec();
+        restoreAvail();
+      }
+    });
+  });
+});
+
+describe("terminal.ts", () => {
+  describe("resolveTerminalBackend", () => {
+    it("prefers an explicit PI_SUBAGENT_TERMINAL override over everything else", () => {
+      assert.equal(
+        resolveTerminalBackend(
+          { PI_SUBAGENT_TERMINAL: "herdr" },
+          { herdrAvailable: () => false, tmuxAvailable: () => true },
+        ),
+        "herdr",
+      );
+      assert.equal(
+        resolveTerminalBackend(
+          { PI_SUBAGENT_TERMINAL: "tmux" },
+          { herdrAvailable: () => true, tmuxAvailable: () => false },
+        ),
+        "tmux",
+      );
+    });
+
+    it("fails closed on an unrecognized explicit override instead of guessing", () => {
+      assert.throws(
+        () =>
+          resolveTerminalBackend(
+            { PI_SUBAGENT_TERMINAL: "zellij" },
+            { herdrAvailable: () => true, tmuxAvailable: () => true },
+          ),
+        /Unknown PI_SUBAGENT_TERMINAL value "zellij"/,
+      );
+    });
+
+    it("selects Herdr only when HERDR_ENV=1 AND an explicit caller pane AND the CLI is reachable", () => {
+      assert.equal(
+        resolveTerminalBackend(
+          { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+          { herdrAvailable: () => true, tmuxAvailable: () => true },
+        ),
+        "herdr",
+      );
+      // Missing pane id: do not guess the focused pane — fall through to tmux.
+      assert.equal(
+        resolveTerminalBackend(
+          { HERDR_ENV: "1" },
+          { herdrAvailable: () => true, tmuxAvailable: () => true },
+        ),
+        "tmux",
+      );
+      // HERDR_ENV=1 alone (no pane id) with no tmux fallback available either.
+      assert.equal(
+        resolveTerminalBackend(
+          { HERDR_ENV: "1" },
+          { herdrAvailable: () => true, tmuxAvailable: () => false },
+        ),
+        null,
+      );
+      // CLI unreachable despite both env vars set: fall through to tmux.
+      assert.equal(
+        resolveTerminalBackend(
+          { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" },
+          { herdrAvailable: () => false, tmuxAvailable: () => true },
+        ),
+        "tmux",
+      );
+    });
+
+    it("falls back to tmux when Herdr context is absent, and to null when neither is available", () => {
+      assert.equal(
+        resolveTerminalBackend({}, { herdrAvailable: () => false, tmuxAvailable: () => true }),
+        "tmux",
+      );
+      assert.equal(
+        resolveTerminalBackend({}, { herdrAvailable: () => false, tmuxAvailable: () => false }),
+        null,
+      );
+    });
+  });
+
+  describe("detectBackendFromSurface", () => {
+    it("routes tmux-shaped ids (%N) to tmux and colon-shaped ids to herdr", () => {
+      assert.equal(detectBackendFromSurface("%12"), "tmux");
+      assert.equal(detectBackendFromSurface("w1:p3"), "herdr");
+    });
+
+    it("throws for an id matching neither shape, instead of guessing", () => {
+      assert.throws(() => detectBackendFromSurface("bogus-id"), /Cannot determine terminal backend/);
+    });
+  });
+
+  describe("dispatch", () => {
+    it("routes a new surface to Herdr when explicitly configured, independent of real env/availability", async () => {
+      const prevTerminal = process.env.PI_SUBAGENT_TERMINAL;
+      process.env.PI_SUBAGENT_TERMINAL = "herdr";
+      const restoreAvail = __setHerdrAvailableForTest__(true);
+      const restoreExec = __setHerdrExecutorForTest__(() =>
+        ({ stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p9" } } }), exitCode: 0 }),
+      );
+      try {
+        assert.equal(terminalCreateSurface("worker"), "w1:p9");
+      } finally {
+        restoreExec();
+        restoreAvail();
+        restoreEnvVar("PI_SUBAGENT_TERMINAL", prevTerminal);
+      }
+    });
+
+    it("routes an existing surface's operations by id shape, not by current config", async () => {
+      // A "%…"-shaped id always goes to tmux, even with PI_SUBAGENT_TERMINAL=herdr set —
+      // a subagent's pane keeps talking to the backend that actually created it.
+      const prevTerminal = process.env.PI_SUBAGENT_TERMINAL;
+      process.env.PI_SUBAGENT_TERMINAL = "herdr";
+      try {
+        assert.throws(() => terminalSendCommand("%12", "echo hi"), /tmux is required/);
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_TERMINAL", prevTerminal);
+      }
+
+      // A colon-shaped id always goes to herdr, even with no override set.
+      const prevTerminal2 = process.env.PI_SUBAGENT_TERMINAL;
+      delete process.env.PI_SUBAGENT_TERMINAL;
+      const restoreAvail = __setHerdrAvailableForTest__(true);
+      let capturedArgs: string[] | undefined;
+      const restoreExec = __setHerdrExecutorForTest__((args) => {
+        capturedArgs = args;
+        return { stdout: "", exitCode: 0 };
+      });
+      try {
+        terminalSendCommand("w1:p2", "echo hi");
+        assert.deepEqual(capturedArgs, ["pane", "run", "w1:p2", "echo hi"]);
+      } finally {
+        restoreExec();
+        restoreAvail();
+        restoreEnvVar("PI_SUBAGENT_TERMINAL", prevTerminal2);
+      }
     });
   });
 });

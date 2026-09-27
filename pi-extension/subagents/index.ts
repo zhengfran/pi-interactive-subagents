@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -24,7 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+} from "./terminal.ts";
 
 import {
   countSessionEntryLines,
@@ -229,7 +229,16 @@ function getToolExtensionPath(tool: string): string | undefined {
   // was disabled/removed but a project-local extension re-registered it).
   const builtin = map[tool];
   if (builtin && existsSync(builtin)) return builtin;
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
+  const registered = EXTRA_TOOL_EXTENSIONS.get(tool);
+  if (registered) return registered;
+  // pi-web-access can be installed as a Pi-managed npm package, not as
+  // separate web-search/web-fetch extensions. Children disable discovery,
+  // so explicitly load its entry point for each requested web tool.
+  if (["web_search", "fetch_content", "get_search_content", "source_check"].includes(tool)) {
+    const webAccess = join(getAgentConfigDir(), "npm", "node_modules", "pi-web-access", "index.ts");
+    if (existsSync(webAccess)) return webAccess;
+  }
+  return undefined;
 }
 
 /**
@@ -508,10 +517,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require a terminal backend (tmux or Herdr). ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "terminal backend not available" },
   };
 }
 
@@ -840,6 +849,8 @@ function applySandboxToParts(
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     parts.push("--model", shellEscape(model));
+  } else if (loadout.thinking) {
+    parts.push("--thinking", shellEscape(loadout.thinking));
   }
 
   if (loadout.identity) {
@@ -1008,7 +1019,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}": ` +
         `${error?.message ?? String(error)}`,
     };
   }

@@ -1,10 +1,11 @@
 /**
- * tmux surface layer — the only terminal multiplexer this extension supports.
+ * tmux surface layer — one of two terminal backends this extension supports
+ * (see herdr.ts for the other, and terminal.ts for backend selection).
  *
- * Everything the extension does to a pane goes through the small API in this
- * file: create/split a pane, type a command into it, read its screen, close
- * it, and poll for exit. Keeping the tmux calls isolated here means index.ts
- * stays testable without a multiplexer running.
+ * Everything the extension does to a tmux pane goes through the small API in
+ * this file: create/split a pane, type a command into it, read its screen,
+ * close it, and poll for exit. Keeping the tmux calls isolated here means
+ * index.ts stays testable without a multiplexer running.
  *
  * Panes are identified by tmux pane ids (e.g. `%12`). Splits always target
  * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
@@ -12,9 +13,13 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { shellEscape } from "./shell.ts";
+import { writeCommandScript } from "./script-file.ts";
+import {
+  interpretExitSidecar,
+  pollForExit as genericPollForExit,
+  type PollResult,
+} from "./poll.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -63,9 +68,7 @@ function requireTmux(): void {
 
 // ── Shell helpers ──
 
-export function shellEscape(s: string): string {
-  return "'" + s.replace(/'/g, "'\\''") + "'";
-}
+export { shellEscape };
 
 // ── Pane layout ──
 
@@ -180,24 +183,7 @@ export function sendLongCommand(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
-  const scriptPath =
-    options?.scriptPath ??
-    join(
-      tmpdir(),
-      "pi-subagent-scripts",
-      `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
-    );
-  mkdirSync(dirname(scriptPath), { recursive: true });
-
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
-  }
-  scriptParts.push(command);
-
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
+  const scriptPath = writeCommandScript(command, options);
   sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
@@ -240,43 +226,15 @@ export function closeSurface(surface: string): void {
 
 // ── Exit polling ──
 
-export interface PollResult {
-  /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
-  exitCode: number;
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
-  errorMessage?: string;
-}
-
-/**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
- *
- * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
- */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  return { reason: "done", exitCode: 0 };
-}
+export type { PollResult };
 
 export const __pollForExitTest__ = { interpretExitSidecar };
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
+ * Poll until the subagent exits. See poll.ts for the shared algorithm; this
+ * just plugs in tmux's readScreenAsync.
  */
-export async function pollForExit(
+export function pollForExit(
   surface: string,
   signal: AbortSignal,
   options: {
@@ -286,69 +244,5 @@ export async function pollForExit(
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
-  const start = Date.now();
-
-  for (;;) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
-    }
-
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
-      try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
-    }
-
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
-    await new Promise<void>((resolve, reject) => {
-      if (signal.aborted) return reject(new Error("Aborted"));
-      const timer = setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, options.interval);
-      function onAbort() {
-        clearTimeout(timer);
-        reject(new Error("Aborted"));
-      }
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
+  return genericPollForExit(surface, signal, options, readScreenAsync);
 }

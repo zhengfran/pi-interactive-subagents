@@ -1,12 +1,33 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Herdr-enabled fork of [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). See [FORK.md](FORK.md) for provenance and changes. The bundled roles use Pi's configured default model; no OpenRouter subscription is required.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+Async subagents for [pi](https://github.com/earendil-works/pi), running in terminal panes — tmux or [Herdr](https://herdr.dev). Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+
+**tmux or Herdr.** See [Terminal backend](#terminal-backend) for how the two are selected, and [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+
+## Install
+
+```bash
+pi install git:github.com/zhengfran/pi-interactive-subagents
+# Needed by the bundled researcher and worker web tools:
+pi install npm:pi-web-access@0.15.0
+```
+
+Start Pi inside a Herdr or tmux pane, then call `subagents_list` or use `/subagent scout <task>`. If another subagent extension is already installed, disable it first to avoid duplicate tool registrations. Restart Pi or run `/reload` after installation; finish existing child tasks before reloading.
+
+This fork uses current `@earendil-works` Pi packages and `typebox`. Unit tests run with Pi 0.87.1. The web-tool adapter expects Pi's standard managed npm installation of `pi-web-access` under the agent directory, or an explicitly registered backing extension.
+
+### Scope and limitations
+
+- Herdr support is a **terminal transport**, not additional harness support. Bundled agents run Pi; Kiro and Codex are not implemented.
+- Upstream's optional `cli: claude` path remains experimental: it bypasses permission prompts, ignores the Pi tool allowlist, lacks finished-session native resume, and follow-ups can prevent automatic completion. No bundled role selects it.
+- Tool allowlists are not an OS sandbox. Omitting a tool list can leave a Pi child unrestricted; review agent definitions before use, including project-local overrides discovered without a separate trust check.
+- Herdr's agent-state controls are not used as completion receipts; existing sidecar/sentinel and transcript collection remain in place.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own terminal pane (tmux or Herdr — see [Terminal backend](#terminal-backend)) — a right split off the parent pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +38,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …).
+On tmux, panes are kept evenly sized: the extension re-applies an `even-horizontal` layout after every spawn and exit (debounced). The layout is a single constant, `SUBAGENT_TMUX_LAYOUT` in `pi-extension/subagents/tmux.ts` — change it to any named tmux layout (`main-vertical`, `tiled`, …). Herdr has no equivalent "apply a named layout to every pane in the tab" command, so this auto-rebalancing is tmux-only — see [Terminal backend](#terminal-backend).
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -29,7 +50,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
+| `subagent` | Spawn a sub-agent in a dedicated terminal pane (tmux or Herdr, async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -76,9 +97,9 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | Pi default | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | Pi default | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | Pi default | `read`, `write`, `edit`, `bash`, web tools + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
 
@@ -90,7 +111,6 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
@@ -108,7 +128,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `get_search_content`, `source_check` (from Pi-managed `pi-web-access`), `safe_bash`; legacy standalone web/video extensions remain supported when installed. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -175,18 +195,56 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
+## Terminal backend
+
+Subagent panes run on one of two interchangeable terminal transports: **tmux** or **[Herdr](https://herdr.dev)**. Every tool (`subagent`, `subagent_message`, …) behaves identically either way — this only affects what a pane physically is and how it's created/closed. Backend selection is independent from which agent CLI runs inside the pane (pi, or the Claude Code CLI via `cli: claude` in an agent's frontmatter — see [Frontmatter reference](#frontmatter-reference)); this is a **terminal transport** choice, not a harness/lifecycle integration.
+
+Selection precedence for a *new* pane:
+
+1. **Explicit override** — `PI_SUBAGENT_TERMINAL=herdr` or `PI_SUBAGENT_TERMINAL=tmux`. An unrecognized value is a hard error rather than a silent fallback.
+2. **Valid Herdr context** — `HERDR_ENV=1` *and* an explicit caller pane (`HERDR_PANE_ID` set) *and* the `herdr` CLI reachable. Both env vars are required: `HERDR_ENV=1` alone doesn't prove there's a real pane to split from, and this extension never guesses "whichever pane the user currently has focused" — new panes always split off the parent pi's own pane.
+3. **tmux fallback** — if running inside tmux (`TMUX` set, `tmux` on PATH).
+4. Otherwise: subagent tools report a "no terminal backend available" error with a setup hint for both.
+
+A running subagent's pane always keeps talking to whichever backend actually created it (panes are self-identifying: tmux ids look like `%12`, Herdr ids look like `w1:p3`) — this doesn't change mid-flight even if the env/config above would resolve differently later.
+
+### Preserved vs. Herdr-specific behavior
+
+- **Preserved**: spawn/message/list tools, the completion widget, sidecar/sentinel-based completion detection (`.exit` files, `__SUBAGENT_DONE_<code>__`), `ask_question`, session resume, and the Claude Code CLI path (`cli: claude`) all work the same regardless of backend.
+- **Not supported on Herdr**: automatic pane-layout rebalancing (Herdr's CLI has no "apply a named layout across the tab" command, unlike tmux's `select-layout`) and left/up splits (Herdr's `pane split` only supports `right`/`down` — this extension only ever splits `right` for new subagents, so this doesn't affect normal use, but a direct `right`/`down`-only restriction applies if `createSurfaceSplit` is ever called with `left`/`up` under Herdr).
+- **Not (yet) used**: Herdr also exposes agent-aware lifecycle state (`agent start`/`agent prompt`/`agent wait`, idle/done/blocked/unknown). This phase does not use it — Herdr's idle/done is not a reliable per-message completion receipt (it can settle on an already-in-flight turn, and is affected by seen/focus state), so it isn't a drop-in replacement for the sidecar/sentinel completion mechanism above. A future phase could build proper cross-harness lifecycle support on top of it; this phase is terminal transport only.
+
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- [pi](https://github.com/earendil-works/pi) with the current `@earendil-works` package names
+- One of:
+  - [tmux](https://github.com/tmux/tmux)
+  - [Herdr](https://herdr.dev), with `HERDR_ENV=1` and `HERDR_PANE_ID` set in the calling pane (Herdr sets these natively)
 
 ```bash
 tmux new -A -s pi 'pi'
+# or, inside a Herdr pane:
+pi
+```
+
+## Development
+
+Use Node.js 24 or newer:
+
+```bash
+npm ci
+npm test
+```
+
+Live integration tests are opt-in and require tmux plus configured Pi model access; they may make model requests:
+
+```bash
+npm run test:integration
 ```
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+Forked from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents), based on [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License
 
