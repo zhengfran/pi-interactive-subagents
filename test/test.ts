@@ -3109,18 +3109,22 @@ describe("terminal.ts", () => {
   });
 
   describe("dispatch", () => {
-    it("routes a new surface to Herdr when explicitly configured, independent of real env/availability", async () => {
+    it("routes a new surface to Herdr with an isolated caller context", async () => {
       const prevTerminal = process.env.PI_SUBAGENT_TERMINAL;
+      const prevPane = process.env.HERDR_PANE_ID;
       process.env.PI_SUBAGENT_TERMINAL = "herdr";
+      process.env.HERDR_PANE_ID = "w1:p1";
       const restoreAvail = __setHerdrAvailableForTest__(true);
-      const restoreExec = __setHerdrExecutorForTest__(() =>
-        ({ stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p9" } } }), exitCode: 0 }),
-      );
+      const restoreExec = __setHerdrExecutorForTest__((args) => {
+        assert.deepEqual(args, ["pane", "split", "--pane", "w1:p1", "--direction", "right", "--no-focus"]);
+        return { stdout: JSON.stringify({ result: { pane: { pane_id: "w1:p9" } } }), stderr: "", exitCode: 0 };
+      });
       try {
         assert.equal(terminalCreateSurface("worker"), "w1:p9");
       } finally {
         restoreExec();
         restoreAvail();
+        restoreEnvVar("HERDR_PANE_ID", prevPane);
         restoreEnvVar("PI_SUBAGENT_TERMINAL", prevTerminal);
       }
     });
@@ -3129,10 +3133,14 @@ describe("terminal.ts", () => {
       // A "%…"-shaped id always goes to tmux, even with PI_SUBAGENT_TERMINAL=herdr set —
       // a subagent's pane keeps talking to the backend that actually created it.
       const prevTerminal = process.env.PI_SUBAGENT_TERMINAL;
+      const prevTmux = process.env.TMUX;
       process.env.PI_SUBAGENT_TERMINAL = "herdr";
+      // Never send input to a real tmux pane when tests run inside tmux.
+      delete process.env.TMUX;
       try {
         assert.throws(() => terminalSendCommand("%12", "echo hi"), /tmux is required/);
       } finally {
+        restoreEnvVar("TMUX", prevTmux);
         restoreEnvVar("PI_SUBAGENT_TERMINAL", prevTerminal);
       }
 
