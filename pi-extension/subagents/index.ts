@@ -10,10 +10,14 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
-  copyFileSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { claudeCommand, claudeOutcome, claudeTools, newClaudeId, prepareClaudeRun, readClaudeSessionId,
+  tickClaudeRun, type ClaudeRun } from "./claude.ts";
+import { errorReceiptFile, isProcessRunLive, type ProcessRun } from "./process-run.ts";
+import { assertKiroAvailable, cleanupKiroRun, kiroCommand, kiroTools, prepareKiroRun,
+  readKiroSessionId, readKiroState, tickKiroRun, validateKiroProfile, type KiroRun } from "./kiro.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -23,7 +27,6 @@ import {
   pollForExit,
   closeSurface,
   shellEscape,
-  readScreen,
 } from "./terminal.ts";
 
 import {
@@ -617,6 +620,7 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
+  processRun?: ProcessRun;
   activityFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
@@ -625,8 +629,11 @@ interface RunningSubagent {
     error?: string;
   };
   abortController?: AbortController;
-  cli?: string;
-  sentinelFile?: string;
+  cli?: "claude" | "kiro";
+  kiro?: KiroRun;
+  claude?: ClaudeRun;
+  registryDir?: string;
+  nativeSessionId?: string;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -915,7 +922,7 @@ function activityLabel(activity: SubagentActivityState): string | undefined {
 }
 
 function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  if (running.cli === "claude") return;
+  if (running.cli) return;
 
   const activityFile = running.activityFile;
   const read: ActivityReadResult = activityFile
@@ -1011,7 +1018,12 @@ function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendCommand,
+  isLive: typeof isProcessRunLive = isProcessRunLive,
 ): { ok: true } | { error: string } {
+  if (!isLive(running.processRun) || running.activity?.phase === "done") {
+    return { error: `Subagent "${running.name}" is starting, exiting, or no longer live. ` +
+      "No input was sent. Its watcher will report completion or failure; retry by name after that result to resume." };
+  }
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     send(running.surface, flattened);
@@ -1028,6 +1040,7 @@ function steerSubagent(
 function handleSubagentSteer(
   params: { name?: string; message?: string },
   send: (surface: string, command: string) => void = sendCommand,
+  isLive: typeof isProcessRunLive = isProcessRunLive,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1047,7 +1060,23 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
+  const native = running.kiro ?? running.claude;
+  if (native) {
+    const label = running.kiro ? "Kiro" : "Claude Code";
+    if (!isLive(running.processRun) || native.quittingAt !== undefined) {
+      const error = `${label} subagent "${running.name}" is starting or exiting. No input was sent; retry after its result.`;
+      return { content: [{ type: "text" as const, text: error }], details: { error } };
+    }
+    // Serialize our follow-ups at verified, correlated Stop boundaries: Kiro
+    // Stop has no turn ID, and typing into a busy Claude TUI could be absorbed
+    // mid-turn or land on an approval prompt. Neither is guessed.
+    native.pendingMessages.push(message);
+    return { content: [{ type: "text" as const, text: `Message queued for ${label} subagent "${running.name}". ` +
+      "It will be submitted after the current turn finishes; the final result still arrives automatically." }],
+      details: { id: running.id, name: running.name, status: "queued" } };
+  }
+
+  const steer = steerSubagent(running, message, send, isLive);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
@@ -1139,6 +1168,7 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  buildSubagentTask,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1152,6 +1182,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  watchSubagent,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1168,6 +1199,113 @@ function startWidgetRefresh() {
     updateWidget();
   }, 1000);
   (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
+}
+
+async function launchKiroSubagent(options: {
+  id: string; name: string; task: string; displayTask?: string; sessionFile: string; artifactDir: string;
+  processRun: ProcessRun; loadout: SubagentLoadout; cwd: string; autoExit: boolean;
+  interactive: boolean; startTime: number; nativeSessionId?: string; surface?: string;
+}): Promise<RunningSubagent> {
+  const { loadout, sessionFile, artifactDir, processRun } = options;
+  const tools = kiroTools(loadout.toolAllowlist ?? undefined, { spawnable: loadout.spawnable ?? undefined,
+    promptMode: loadout.systemPromptMode ?? undefined, thinking: loadout.thinking ?? undefined });
+  assertKiroAvailable();
+  if (options.nativeSessionId && !loadout.nativeAgentName) throw new Error("Cannot resume Kiro without its saved native agent name.");
+  if (!options.nativeSessionId) {
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    writeFileSync(sessionFile, JSON.stringify({ type: "external_session", harness: "kiro", nativeSessionId: null }) + "\n", { flag: "wx", mode: 0o600 });
+    writeSubagentLoadout(sessionFile, loadout);
+  }
+  const kiro = prepareKiroRun({ artifactDir, processRun, cwd: options.cwd, sessionFile,
+    tools, identity: loadout.identity, nativeSessionId: options.nativeSessionId,
+    nativeAgentName: loadout.nativeAgentName, autoExit: options.autoExit });
+  writeSubagentLoadout(sessionFile, { ...loadout, nativeAgentName: kiro.profileName });
+  let surface: string | undefined = options.surface;
+  try {
+    validateKiroProfile(kiro);
+    if (!surface) {
+      surface = createSurface(options.name);
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+    const launchScriptFile = join(artifactDir, "subagent-scripts", `kiro-${options.id}.sh`);
+    sendLongCommand(surface, kiroCommand(kiro, options.task, { model: loadout.model, thinking: loadout.thinking }),
+      { scriptPath: launchScriptFile, processRun });
+    const running: RunningSubagent = {
+      id: options.id, name: options.name, task: options.displayTask ?? options.task, agent: loadout.agent ?? undefined,
+      surface, startTime: options.startTime, sessionFile, launchScriptFile, processRun,
+      cli: "kiro", kiro, registryDir: artifactDir, nativeSessionId: options.nativeSessionId,
+      interactive: options.interactive, statusState: createStatusState({ source: "kiro", startTimeMs: options.startTime }),
+    };
+    runningSubagents.set(options.id, running);
+    return running;
+  } catch (error) {
+    if (surface) { try { closeSurface(surface); } catch {} }
+    cleanupKiroRun(kiro);
+    throw error;
+  }
+}
+
+/** Native Claude Code TUI in an owned pane, shared by spawn and resume. */
+async function launchClaudeSubagent(options: {
+  id: string; name: string; task: string; displayTask?: string; sessionFile: string; nativeSessionId: string;
+  artifactDir: string; processRun: ProcessRun; loadout: SubagentLoadout; cwd: string; resume: boolean;
+  autoExit: boolean; interactive: boolean; startTime: number; surface?: string;
+}): Promise<RunningSubagent> {
+  const { loadout, sessionFile, artifactDir, processRun } = options;
+  const tools = claudeTools(loadout.toolAllowlist ?? undefined, { spawnable: loadout.spawnable ?? undefined,
+    thinking: loadout.thinking });
+  if (!options.resume) {
+    // A marker, not a fabricated Pi transcript. It anchors a loadout snapshot
+    // and registry entry without mixing native Claude history into Pi's format.
+    mkdirSync(dirname(sessionFile), { recursive: true });
+    writeFileSync(sessionFile, JSON.stringify({ type: "external_session", harness: "claude",
+      nativeSessionId: options.nativeSessionId }) + "\n", { flag: "wx", mode: 0o600 });
+    writeSubagentLoadout(sessionFile, loadout);
+  }
+  let surface = options.surface;
+  try {
+    const claude = prepareClaudeRun({ artifactDir, processRun, cwd: options.cwd, sessionId: options.nativeSessionId,
+      resume: options.resume, autoExit: options.autoExit });
+    if (!surface) {
+      surface = createSurface(options.name);
+      await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+    }
+    const launchScriptFile = join(artifactDir, "subagent-scripts", `claude-${options.resume ? "resume-" : ""}${options.id}.sh`);
+    sendLongCommand(surface, claudeCommand(claude, options.task, { tools, model: loadout.model, thinking: loadout.thinking,
+      identity: loadout.identity, promptMode: loadout.systemPromptMode }), {
+      scriptPath: launchScriptFile, processRun,
+      scriptPreamble: `# Claude Code subagent launch script for ${options.name}\n# Surface: ${surface}`,
+    });
+    const running: RunningSubagent = {
+      id: options.id, name: options.name, task: options.displayTask ?? options.task, agent: loadout.agent ?? undefined,
+      surface, startTime: options.startTime, sessionFile, launchScriptFile, processRun,
+      cli: "claude", claude, registryDir: artifactDir, nativeSessionId: options.nativeSessionId,
+      interactive: options.interactive, statusState: createStatusState({ source: "claude", startTimeMs: options.startTime }),
+    };
+    runningSubagents.set(options.id, running);
+    return running;
+  } catch (error) {
+    if (surface) { try { closeSurface(surface); } catch {} }
+    throw error;
+  }
+}
+
+/**
+ * Build the initial task message for a blank (non-fork) session. Shared by the
+ * Pi, Claude and Kiro spawn paths so the harnesses cannot drift. Only
+ * full-context fork mode inherits prior conversation state and gets the raw task.
+ */
+function buildSubagentTask(task: string, options: {
+  autoExit: boolean; roleBlock?: string; inheritsConversationContext?: boolean;
+}): string {
+  if (options.inheritsConversationContext) return task;
+  const modeHint = options.autoExit
+    ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
+    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
+  const summaryInstruction = options.autoExit
+    ? "Your FINAL assistant message should summarize what you accomplished."
+    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
+  return `${options.roleBlock ?? ""}\n\n${modeHint}\n\n${task}\n\n${summaryInstruction}`;
 }
 
 /**
@@ -1190,11 +1328,19 @@ async function launchSubagent(
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  if (agentDefs?.cli && !["pi", "claude", "kiro"].includes(agentDefs.cli)) {
+    throw new Error(`Interactive harness "${agentDefs.cli}" is unsupported: native turn/session contract not verified.`);
+  }
+  if (agentDefs?.cli === "claude") {
+    claudeTools(effectiveTools, { spawnable: agentDefs.subagentAgents, skills: effectiveSkills,
+      sessionMode: agentDefs.sessionMode, thinking: effectiveThinking });
+  }
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+  const processRun = { id, receiptFile: join(artifactDir, "subagent-runs", `${id}.json`) };
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
@@ -1211,6 +1357,22 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 6),
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+
+  if (agentDefs?.cli === "kiro") {
+    kiroTools(effectiveTools, { spawnable: agentDefs.subagentAgents, skills: effectiveSkills,
+      sessionMode: agentDefs.sessionMode, promptMode: agentDefs.systemPromptMode, thinking: effectiveThinking });
+    const externalSessionFile = join(artifactDir, "kiro-sessions", `${uuid}.jsonl`);
+    // Kiro is always standalone and carries the role identity in its profile prompt,
+    // so only the shared autonomous-mode/summary wrapper is added here.
+    const task = buildSubagentTask(params.task, { autoExit: agentDefs.autoExit ?? false });
+    return launchKiroSubagent({ id, name: params.name, task, displayTask: params.task, sessionFile: externalSessionFile,
+      artifactDir, processRun, cwd: targetCwdForSession, startTime, surface: options?.surface,
+      autoExit: agentDefs.autoExit ?? false, interactive: effectiveInteractive,
+      loadout: { harness: "kiro", agent: params.agent, toolAllowlist: effectiveTools ?? null,
+        model: effectiveModel ?? null, thinking: effectiveThinking ?? null,
+        systemPromptMode: agentDefs.systemPromptMode ?? "append", identity: agentDefs.body ?? null,
+        spawnable: null, autoExit: agentDefs.autoExit ?? false, cwd: targetCwdForSession, agentDir: null } });
+  }
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
@@ -1235,15 +1397,6 @@ async function launchSubagent(
   mkdirSync(dirname(activityFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
-    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
@@ -1251,76 +1404,20 @@ async function launchSubagent(
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = inheritsConversationContext
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+  const fullTask = buildSubagentTask(params.task, { autoExit: agentDefs?.autoExit ?? false, roleBlock,
+    inheritsConversationContext });
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
-    const sentinelFile = `/tmp/pi-claude-${id}-done`;
-    const pluginDir = join(SUBAGENTS_DIR, "plugin");
-
-    const cmdParts: string[] = [];
-    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-    cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
-
-    if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
-    }
-
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
-    }
-
-    const sp = agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
-    }
-
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
-
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-    const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
-    const running: RunningSubagent = {
-      id,
-      name: params.name,
-      task: params.task,
-      agent: params.agent,
-      surface,
-      startTime,
-      sessionFile: subagentSessionFile,
-      launchScriptFile,
-      cli: "claude",
-      sentinelFile,
-      interactive: effectiveInteractive,
-      statusState: createStatusState({
-        source: "claude",
-        startTimeMs: startTime,
-      }),
-    };
-
-    runningSubagents.set(id, running);
-    return running;
+    const nativeSessionId = newClaudeId();
+    return launchClaudeSubagent({ id, name: params.name, task: fullTask, displayTask: params.task,
+      sessionFile: join(artifactDir, "claude-sessions", `${nativeSessionId}.jsonl`), nativeSessionId,
+      artifactDir, processRun, cwd: targetCwdForSession, startTime, surface, resume: false,
+      autoExit: agentDefs.autoExit ?? false, interactive: effectiveInteractive,
+      loadout: { harness: "claude", agent: params.agent ?? null, toolAllowlist: effectiveTools ?? null,
+        model: effectiveModel ?? null, thinking: effectiveThinking ?? null,
+        systemPromptMode: systemPromptMode ?? null, identity: identityInSystemPrompt ? identity : null,
+        // Always the resolved cwd: native Claude resume looks sessions up per project directory.
+        spawnable: null, autoExit: agentDefs.autoExit ?? false, cwd: targetCwdForSession, agentDir: null } });
   }
 
   // ── Pi CLI path ──
@@ -1386,6 +1483,7 @@ async function launchSubagent(
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_EXIT_FILE=${shellEscape(errorReceiptFile(processRun))}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
@@ -1425,7 +1523,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = piCommand;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1433,15 +1531,21 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
+  try {
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      processRun,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+  } catch (error) {
+    try { closeSurface(surface); } catch {}
+    throw error;
+  }
 
   const running: RunningSubagent = {
     id,
@@ -1452,6 +1556,7 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
+    processRun,
     activityFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
@@ -1469,27 +1574,6 @@ async function launchSubagent(
  * the summary from the session file, cleans up the surface,
  * and removes the entry from runningSubagents.
  */
-const CLAUDE_SESSIONS_DIR = join(
-  process.env.HOME ?? "/tmp",
-  ".pi", "agent", "sessions", "claude-code",
-);
-
-function copyClaudeSession(sentinelFile: string): string | null {
-  try {
-    const transcriptFile = sentinelFile + ".transcript";
-    if (!existsSync(transcriptFile)) return null;
-    const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
-    if (!transcriptPath || !existsSync(transcriptPath)) return null;
-    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
-    const dest = join(CLAUDE_SESSIONS_DIR, filename);
-    copyFileSync(transcriptPath, dest);
-    return filename;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Detect an `ask_question` signal from a still-running subagent and notify the
  * orchestrator without ending the subagent. Each subagent has its own
@@ -1542,49 +1626,59 @@ async function watchSubagent(
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
       interval: 1000,
       sessionFile,
-      sentinelFile: running.sentinelFile,
+      processRun: running.processRun,
       onTick() {
-        observeRunningSubagent(running);
-        deliverPendingQuestion(running);
+        if (running.claude) {
+          tickClaudeRun(running.claude, (text) => {
+            if (!isProcessRunLive(running.processRun)) throw new Error("Claude Code wrapper exited before input delivery.");
+            sendCommand(surface, text);
+          });
+        } else if (running.kiro) {
+          tickKiroRun(running.kiro, (text) => {
+            if (!isProcessRunLive(running.processRun)) throw new Error("Kiro wrapper exited before input delivery.");
+            sendCommand(surface, text);
+          });
+          const nativeSessionId = running.kiro.nativeSessionId;
+          if (nativeSessionId && nativeSessionId !== running.nativeSessionId) {
+            running.nativeSessionId = nativeSessionId;
+            if (running.registryDir) registerName(running.registryDir, name,
+              { sessionFile, sessionId: nativeSessionId, nativeSessionId, harness: "kiro" });
+          }
+        } else {
+          observeRunningSubagent(running);
+          deliverPendingQuestion(running);
+        }
       },
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
-    if (running.cli === "claude") {
-      // Claude Code result extraction
-      let summary = "";
-
-      if (running.sentinelFile) {
-        try {
-          summary = readFileSync(running.sentinelFile, "utf-8").trim();
-        } catch {}
-      }
-
-      if (!summary) {
-        summary = readScreen(surface, 200)
-          .replace(/__SUBAGENT_DONE_\d+__/, "")
-          .trimEnd();
-      }
-
-      if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
-      }
-
-      // Copy Claude session transcript
-      let sessionId: string | null = null;
-      if (running.sentinelFile) {
-        sessionId = copyClaudeSession(running.sentinelFile);
-        try { unlinkSync(running.sentinelFile); } catch {}
-        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
-      }
-
-      closeSurface(surface);
+    if (running.kiro) {
+      const state = readKiroState(running.kiro);
+      const completed = result.reason !== "error" && result.exitCode === 0 &&
+        state?.phase === "stopped" && state.token === running.kiro.expectedToken && !running.kiro.pendingMessages.length;
+      const nativeSessionId = readKiroSessionId(sessionFile);
+      if (nativeSessionId && running.registryDir) registerName(running.registryDir, name,
+        { sessionFile, sessionId: nativeSessionId, nativeSessionId, harness: "kiro" });
+      const summary = completed ? state!.summary! :
+        `Kiro exited without completing the correlated turn (${result.errorMessage ?? `shell exit ${result.exitCode}`}).`;
+      try { closeSurface(surface); } catch {}
       runningSubagents.delete(running.id);
+      return { name, task, summary, sessionFile, elapsed, exitCode: completed ? 0 : result.exitCode || 1,
+        ...(nativeSessionId ? { sessionId: nativeSessionId } : {}), ...(!completed ? { errorMessage: summary } : {}) };
+    }
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+    if (running.claude) {
+      // Reached only after the supervised process exited (never on a Stop
+      // receipt alone), so the native transcript is flushed for resume.
+      const outcome = claudeOutcome(running.claude, result);
+      try { closeSurface(surface); } catch { /* exec-wrapped pane may already be gone. */ }
+      runningSubagents.delete(running.id);
+      const nativeSessionId = running.claude.sessionId;
+      return { name, task, summary: outcome.summary, sessionFile, elapsed,
+        exitCode: outcome.completed ? 0 : result.exitCode || 1,
+        sessionId: nativeSessionId, claudeSessionId: nativeSessionId,
+        ...(!outcome.completed ? { errorMessage: outcome.summary } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1609,7 +1703,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    try { closeSurface(surface); } catch { /* exec-wrapped pane may already be gone. */ }
     runningSubagents.delete(running.id);
 
     return {
@@ -1647,7 +1741,10 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      sessionFile,
     };
+  } finally {
+    if (running.kiro) cleanupKiroRun(running.kiro);
   }
 }
 
@@ -1822,7 +1919,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // not completion, so the handle exists even if the parent dies mid-run.
         registerName(parentArtifactDir, running.name, {
           sessionFile: running.sessionFile,
-          sessionId: getSessionId(running.sessionFile),
+          sessionId: running.nativeSessionId ?? getSessionId(running.sessionFile),
+          harness: running.cli ?? "pi",
+          ...(running.nativeSessionId ? { nativeSessionId: running.nativeSessionId } : {}),
         });
 
         // Create a separate AbortController for the watcher
@@ -2055,12 +2154,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderResult(result, _opts, theme) {
         const details = result.details as any;
 
-        if (details?.status === "steered") {
+        if (details?.status === "steered" || details?.status === "queued") {
           return new Text(
             theme.fg("success", "✓") +
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
-              theme.fg("dim", " — message delivered"),
+              theme.fg("dim", details.status === "queued" ? " — message queued" : " — message delivered"),
             0,
             0,
           );
@@ -2112,6 +2211,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ctx.sessionManager.getSessionDir(),
           ctx.sessionManager.getSessionId(),
         );
+        const processRun = { id, receiptFile: join(parentArtifactDir, "subagent-runs", `${id}.json`) };
         const entry = resolveNameInRegistry(parentArtifactDir, requestedName);
         if (!entry) {
           const known = Object.keys(readNameRegistry(parentArtifactDir));
@@ -2151,6 +2251,82 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        if (!([undefined, "pi", "claude", "kiro"] as unknown[]).includes(entry.harness) ||
+            !([undefined, "pi", "claude", "kiro"] as unknown[]).includes(loadout.harness) ||
+            (entry.harness ?? "pi") !== (loadout.harness ?? "pi")) {
+          const err = `Cannot safely resume "${name}": registry and sandbox harness disagree.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if (entry.harness === "kiro") {
+          const nativeSessionId = readKiroSessionId(sessionPath);
+          if (!nativeSessionId || (entry.nativeSessionId && entry.nativeSessionId !== nativeSessionId) || !loadout.cwd) {
+            const error = `Cannot safely resume "${name}": native Kiro identity or original cwd is missing/inconsistent.`;
+            return { content: [{ type: "text" as const, text: error }], details: { error } };
+          }
+          const running = await launchKiroSubagent({ id, name, task: message, sessionFile: sessionPath,
+            artifactDir: parentArtifactDir, processRun, loadout, cwd: loadout.cwd, startTime,
+            autoExit, interactive, nativeSessionId });
+          startWidgetRefresh();
+          startStatusRefresh(pi);
+          const watcherAbort = new AbortController();
+          running.abortController = watcherAbort;
+          watchSubagent(running, watcherAbort.signal).then((result) => {
+            updateWidget();
+            pi.sendMessage({ customType: "subagent_result", content: resolveResultPresentation(result, name), display: true,
+              details: { name, task: message, sessionFile: sessionPath, sessionId: nativeSessionId,
+                exitCode: result.exitCode, elapsed: result.elapsed, ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}) } },
+              { triggerTurn: true, deliverAs: "steer" });
+          }).catch((error) => {
+            updateWidget();
+            pi.sendMessage({ customType: "subagent_result", content: `Kiro resume error: ${error?.message ?? error}`,
+              display: true, details: { name, error: error?.message } }, { triggerTurn: true, deliverAs: "steer" });
+          });
+          return { content: [{ type: "text" as const, text: `Kiro session "${name}" resumed.` }],
+            details: { id, name, sessionId: nativeSessionId, sessionFile: sessionPath,
+              launchScriptFile: running.launchScriptFile, status: "started" } };
+        }
+        if (entry.harness === "claude") {
+          const nativeSessionId = readClaudeSessionId(sessionPath);
+          if (!nativeSessionId || entry.nativeSessionId !== nativeSessionId || !loadout.cwd) {
+            const err = `Cannot safely resume "${name}": native Claude identity or original cwd is missing/inconsistent.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
+          if (!message?.trim()) {
+            const err = `Resuming Claude subagent "${name}" requires a non-empty message.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
+          let running: RunningSubagent;
+          try {
+            running = await launchClaudeSubagent({ id, name, task: message, sessionFile: sessionPath, nativeSessionId,
+              artifactDir: parentArtifactDir, processRun, loadout, cwd: loadout.cwd, startTime, resume: true,
+              autoExit, interactive });
+          } catch (error: any) {
+            const err = `Cannot safely resume "${name}": ${error?.message ?? String(error)}`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
+          const launchScriptFile = running.launchScriptFile;
+          startWidgetRefresh();
+          startStatusRefresh(pi);
+          const watcherAbort = new AbortController();
+          running.abortController = watcherAbort;
+          watchSubagent(running, watcherAbort.signal).then((result) => {
+            updateWidget();
+            pi.sendMessage({ customType: "subagent_result",
+              content: resolveResultPresentation(result, name), display: true,
+              details: { name, task: message, exitCode: result.exitCode, elapsed: result.elapsed,
+                sessionFile: sessionPath, sessionId: nativeSessionId,
+                ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}) },
+            }, { triggerTurn: true, deliverAs: "steer" });
+          }).catch((error) => {
+            updateWidget();
+            pi.sendMessage({ customType: "subagent_result", content: `Resume error: ${error?.message ?? String(error)}`,
+              display: true, details: { name, error: error?.message } },
+              { triggerTurn: true, deliverAs: "steer" });
+          });
+          return { content: [{ type: "text" as const, text: `Session "${name}" resumed.` }],
+            details: { id, name, sessionId: nativeSessionId, sessionFile: sessionPath, launchScriptFile, status: "started" } };
         }
 
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
@@ -2213,6 +2389,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_EXIT_FILE=${shellEscape(errorReceiptFile(processRun))}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
@@ -2223,7 +2400,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2234,8 +2411,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
+        try { sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
+          processRun,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
             `# Generated: ${new Date().toISOString()}`,
@@ -2243,7 +2421,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `# Surface: ${surface}`,
             ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
           ].join("\n"),
-        });
+        }); } catch (error) {
+          try { closeSurface(surface); } catch {}
+          throw error;
+        }
 
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
@@ -2254,6 +2435,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startTime,
           sessionFile: sessionPath,
           launchScriptFile,
+          processRun,
           activityFile,
           interactive,
           statusState: createStatusState({

@@ -14,10 +14,11 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { shellEscape } from "./shell.ts";
-import { writeCommandScript } from "./script-file.ts";
+import { writeCommandScript, type CommandScriptOptions } from "./script-file.ts";
 import {
   interpretExitSidecar,
   pollForExit as genericPollForExit,
+  type PollOptions,
   type PollResult,
 } from "./poll.ts";
 
@@ -181,10 +182,10 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: CommandScriptOptions,
 ): string {
   const scriptPath = writeCommandScript(command, options);
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  sendCommand(surface, `${options?.processRun ? "exec " : ""}bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
@@ -210,7 +211,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   const { stdout } = await execFileAsync(
     "tmux",
     ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-    { encoding: "utf8" },
+    { encoding: "utf8", timeout: 5000 },
   );
   return stdout;
 }
@@ -220,8 +221,12 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireTmux();
-  execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
-  rebalanceSurfaces();
+  try {
+    execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8", timeout: 5000 });
+  } finally {
+    // An exec-wrapped process may already have closed its pane on exit.
+    rebalanceSurfaces();
+  }
 }
 
 // ── Exit polling ──
@@ -237,12 +242,7 @@ export const __pollForExitTest__ = { interpretExitSidecar };
 export function pollForExit(
   surface: string,
   signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
+  options: PollOptions,
 ): Promise<PollResult> {
   return genericPollForExit(surface, signal, options, readScreenAsync);
 }

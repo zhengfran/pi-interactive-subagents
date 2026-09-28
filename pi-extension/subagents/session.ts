@@ -94,6 +94,10 @@ export function seedSubagentSessionFile(params: {
  * deleted.
  */
 export interface SubagentLoadout {
+  /** Missing in older snapshots: those are Pi sessions. */
+  harness?: "pi" | "claude" | "kiro";
+  /** Kiro resumes its saved agent name even when --agent differs. */
+  nativeAgentName?: string;
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
@@ -158,6 +162,10 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Missing in older entries: those are Pi sessions. */
+  harness?: "pi" | "claude" | "kiro";
+  /** Native harness UUID (never inferred by scanning cwd/latest transcript). */
+  nativeSessionId?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

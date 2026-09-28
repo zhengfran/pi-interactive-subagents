@@ -28,7 +28,8 @@
 import * as tmux from "./tmux.ts";
 import * as herdr from "./herdr.ts";
 import { shellEscape } from "./shell.ts";
-import type { PollResult } from "./poll.ts";
+import type { PollOptions, PollResult } from "./poll.ts";
+import type { CommandScriptOptions } from "./script-file.ts";
 
 export type TerminalBackendName = "tmux" | "herdr";
 
@@ -146,7 +147,7 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: CommandScriptOptions,
 ): string {
   return backendModuleFor(detectBackendFromSurface(surface)).sendLongCommand(surface, command, options);
 }
@@ -166,12 +167,7 @@ export function closeSurface(surface: string): void {
 export function pollForExit(
   surface: string,
   signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
+  options: PollOptions,
 ): Promise<PollResult> {
   return backendModuleFor(detectBackendFromSurface(surface)).pollForExit(surface, signal, options);
 }

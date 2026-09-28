@@ -1,33 +1,26 @@
-/**
- * Backend-agnostic "wait for the subagent to exit" poll loop.
- *
- * Extracted from tmux.ts so tmux and Herdr (and any future backend) share
- * one completion-detection algorithm instead of two copies that could drift.
- * A backend only supplies how to read its pane's screen contents
- * (`readScreenAsync`); the sidecar/sentinel/crash-detection logic below is
- * identical either way.
- */
+/** Backend-independent completion supervision. New launches use durable receipts;
+ * screen sentinels are compatibility-only for older callers without a ProcessRun. */
 import { existsSync, readFileSync, rmSync } from "node:fs";
+import { errorReceiptFile, isProcessAlive, readProcessReceipt, type ProcessRun } from "./process-run.ts";
 
 export interface PollResult {
-  /** How the subagent exited */
   reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
   exitCode: number;
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
 
-/**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
- *
- * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
- * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion
- * in index.ts).
- */
+export interface PollOptions {
+  interval: number;
+  sessionFile?: string;
+  sentinelFile?: string;
+  processRun?: ProcessRun;
+  /** Launch acknowledgement deadline, not a task-duration/idle timeout. */
+  startupTimeoutMs?: number;
+  isComplete?: () => boolean;
+  onTick?: (elapsed: number) => void;
+}
+
+/** Error sidecars describe harness errors even when the process exits zero. */
 export function interpretExitSidecar(data: any): PollResult {
   if (data?.type === "error") {
     const errorMessage =
@@ -39,78 +32,78 @@ export function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-/**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
- *
- * `readScreenAsync` is the only backend-specific dependency — it reads the
- * last `lines` of the target surface's screen, however that backend's CLI
- * exposes it.
- */
+function readExitSidecar(options: PollOptions): PollResult | null {
+  const path = options.processRun ? errorReceiptFile(options.processRun)
+    : options.sessionFile ? `${options.sessionFile}.exit` : undefined;
+  if (!path) return null;
+  try {
+    const data = JSON.parse(readFileSync(path, "utf8"));
+    rmSync(path, { force: true });
+    return interpretExitSidecar(data);
+  } catch { return null; }
+}
+
 export async function pollForExit(
   surface: string,
   signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
+  options: PollOptions,
   readScreenAsync: (surface: string, lines?: number) => Promise<string>,
 ): Promise<PollResult> {
   const start = Date.now();
+  let missingScreenReads = 0;
+  let unhealthyReads = 0;
+  let started = false;
+  const failure = (errorMessage: string): PollResult => ({ reason: "error", exitCode: 1, errorMessage });
 
   for (;;) {
-    if (signal.aborted) {
-      throw new Error("Aborted while waiting for subagent to finish");
-    }
+    if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
 
-    // Fast path: check for .exit sidecar file (written by the error path)
-    if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
+    const sidecar = readExitSidecar(options);
+    if (sidecar) return sidecar;
+    // Harness-specific native session/turn correlation (e.g. Claude Stop).
+    if (options.isComplete?.()) return { reason: "done", exitCode: 0 };
+
+    if (options.processRun) {
+      const receipt = readProcessReceipt(options.processRun);
+      if (receipt) {
+        started = true;
+        if (receipt.exitCode !== undefined) {
+          // The harness may have written its diagnostic between our first
+          // sidecar check and the wrapper's final atomic rename.
+          return readExitSidecar(options) ?? { reason: "done", exitCode: receipt.exitCode };
         }
-      } catch {}
-    }
-
-    // Check Claude sentinel file (written by plugin Stop hook)
-    if (options.sentinelFile) {
+        if (isProcessAlive(receipt.pid)) unhealthyReads = 0;
+        else unhealthyReads++;
+      } else if (started) {
+        unhealthyReads++;
+      }
+      // SIGKILL/missing receipt cannot park a nested parent forever. Allow two
+      // intervening reads for the exit trap/atomic rename to finish before failing.
+      if (unhealthyReads >= 3) {
+        return failure(`Subagent process ${surface} disappeared or lost its run receipt without reporting an exit.`);
+      }
+      if (!started && Date.now() - start >= (options.startupTimeoutMs ?? 30_000)) {
+        return failure(`Subagent ${surface} did not acknowledge startup with a valid run receipt within the launch deadline.`);
+      }
+      // Never parse screen text for supervised runs: narrow-pane wrapping,
+      // scrollback loss, and old/fabricated markers cannot affect completion.
+    } else {
+      if (options.sentinelFile && existsSync(options.sentinelFile)) {
+        return { reason: "sentinel", exitCode: 0 };
+      }
       try {
-        if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
-        }
-      } catch {}
-    }
-
-    // Slow path: read terminal screen for sentinel (crash detection)
-    try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) {
-        return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-      }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
-      if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const screen = await readScreenAsync(surface, 5);
+        missingScreenReads = 0;
+        const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
+        if (match) return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      } catch {
+        const sidecar = readExitSidecar(options);
+        if (sidecar) return sidecar;
+        if (++missingScreenReads >= 3) return failure(`Subagent pane ${surface} is unavailable.`);
       }
     }
 
-    const elapsed = Math.floor((Date.now() - start) / 1000);
-    options.onTick?.(elapsed);
-
+    options.onTick?.(Math.floor((Date.now() - start) / 1000));
     await new Promise<void>((resolve, reject) => {
       if (signal.aborted) return reject(new Error("Aborted"));
       const timer = setTimeout(() => {

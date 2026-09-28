@@ -20,8 +20,9 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { shellEscape } from "./shell.ts";
-import { writeCommandScript } from "./script-file.ts";
-import { pollForExit as genericPollForExit, type PollResult } from "./poll.ts";
+import { writeCommandScript, type CommandScriptOptions } from "./script-file.ts";
+import { pollForExit as genericPollForExit, type PollOptions, type PollResult } from "./poll.ts";
+import { balanceOwnedPanes } from "./herdr-layout.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,7 +41,7 @@ type CliRunnerAsync = (args: string[]) => Promise<CliResult>;
 
 function defaultCliRunner(args: string[]): CliResult {
   try {
-    const stdout = execFileSync("herdr", args, { encoding: "utf8" });
+    const stdout = execFileSync("herdr", args, { encoding: "utf8", timeout: 5000 });
     return { stdout, stderr: "", exitCode: 0 };
   } catch (error: any) {
     // herdr writes a JSON error envelope to STDERR (confirmed empirically —
@@ -57,7 +58,7 @@ function defaultCliRunner(args: string[]): CliResult {
 
 async function defaultCliRunnerAsync(args: string[]): Promise<CliResult> {
   try {
-    const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
+    const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8", timeout: 5000 });
     return { stdout, stderr: "", exitCode: 0 };
   } catch (error: any) {
     return {
@@ -191,6 +192,19 @@ export { shellEscape };
 
 // ── Surface primitives ──
 
+const ownedPanes = new Set<string>();
+let balanceTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleBalance(): void {
+  if (balanceTimer) clearTimeout(balanceTimer);
+  balanceTimer = setTimeout(() => {
+    balanceTimer = null;
+    const caller = callerPaneId();
+    if (caller) void balanceOwnedPanes(caller, ownedPanes).catch(() => {
+      // Cosmetic layout changes must not interrupt subagent lifecycle.
+    });
+  }, 120);
+}
+
 /**
  * Create a new pane for a subagent: a right split off the caller's own pane,
  * so new panes follow the agent rather than the user's focus.
@@ -237,6 +251,10 @@ export function createSurfaceSplit(
   if (typeof paneId !== "string" || !paneId) {
     throw new Error(`herdr pane split returned no pane id: ${JSON.stringify(envelope)}`);
   }
+  if (anchor === callerPaneId()) {
+    ownedPanes.add(paneId);
+    scheduleBalance();
+  }
   return paneId;
 }
 
@@ -263,10 +281,10 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: CommandScriptOptions,
 ): string {
   const scriptPath = writeCommandScript(command, options);
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  sendCommand(surface, `${options?.processRun ? "exec " : ""}bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
@@ -324,8 +342,13 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   requireHerdr();
-  const result = cliRunner(["pane", "close", surface]);
-  parseHerdrEnvelope(result, "pane close");
+  try {
+    const result = cliRunner(["pane", "close", surface]);
+    parseHerdrEnvelope(result, "pane close");
+  } finally {
+    // An exec-wrapped process may already have closed its pane on exit.
+    if (ownedPanes.delete(surface)) scheduleBalance();
+  }
 }
 
 // ── Exit polling ──
@@ -338,18 +361,13 @@ export type { PollResult };
  *
  * Note: Herdr also exposes agent-aware idle/done/blocked states (`agent
  * get`/`agent wait`), but those are not a reliable per-message completion
- * receipt for this extension's purposes (see README) — sidecar/sentinel
- * detection remains the source of truth, same as tmux.
+ * receipt for this extension's purposes (see README). Process receipts and
+ * harness-specific completion remain the source of truth, same as tmux.
  */
 export function pollForExit(
   surface: string,
   signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
+  options: PollOptions,
 ): Promise<PollResult> {
   return genericPollForExit(surface, signal, options, readScreenAsync);
 }

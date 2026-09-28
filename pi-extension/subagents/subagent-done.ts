@@ -241,16 +241,18 @@ export default function (pi: ExtensionAPI) {
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
+      // overload, etc.) to the parent via the per-run error sidecar (legacy
+      // launches fall back to <session>.exit) so the watcher
       // can report a clear failure with the underlying error message.
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
+      const exitFile = process.env.PI_SUBAGENT_EXIT_FILE ?? (sessionFile ? `${sessionFile}.exit` : undefined);
+      if (errorInfo && exitFile) {
         try {
           writeFileSync(
-            `${sessionFile}.exit`,
+            exitFile,
             JSON.stringify({
               type: "error",
               errorMessage: errorInfo.errorMessage,

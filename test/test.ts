@@ -174,6 +174,8 @@ async function withIsolatedAgentEnv(
   const root = createTestDir();
   const previousCwd = process.cwd();
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousAllowed = process.env.PI_SUBAGENT_ALLOWED;
+  delete process.env.PI_SUBAGENT_ALLOWED;
   const projectDir = join(root, "project");
   const projectAgentsDir = join(projectDir, ".pi", "agents");
   const globalDir = join(root, "global");
@@ -189,6 +191,7 @@ async function withIsolatedAgentEnv(
   } finally {
     process.chdir(previousCwd);
     restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", previousAllowed);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -386,6 +389,17 @@ describe("session.ts", () => {
       const entry = resolveNameInRegistry(adir, "worker");
       assert.deepEqual(entry, { sessionFile: "/s/worker.jsonl", sessionId: "id-worker" });
       assert.ok(existsSync(nameRegistryPath(adir)));
+    });
+
+    it("stores native Claude identity alongside legacy Pi entries for reload-safe resume", () => {
+      const adir = join(dir, "art-native");
+      registerName(adir, "legacy", { sessionFile: "/s/pi.jsonl", sessionId: "pi-id" });
+      registerName(adir, "claude", {
+        sessionFile: "/s/claude.jsonl", sessionId: "native-uuid",
+        harness: "claude", nativeSessionId: "native-uuid",
+      });
+      assert.equal(resolveNameInRegistry(adir, "legacy")?.harness, undefined);
+      assert.equal(resolveNameInRegistry(adir, "claude")?.nativeSessionId, "native-uuid");
     });
 
     it("accumulates multiple names and overwrites on re-register", () => {
@@ -1250,13 +1264,15 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("bundled profiles use the configured Pi model and supported web tool names", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
-      const defs = testApi.loadAgentDefaults(name)!;
-      assert.equal(defs.model, undefined);
-      assert.ok(!defs.tools?.includes("web_fetch"));
-    }
-    assert.ok(testApi.loadAgentDefaults("researcher")!.tools?.includes("fetch_content"));
+  it("bundled profiles use the configured Pi model and supported web tool names", async () => {
+    await withIsolatedAgentEnv(() => {
+      for (const name of ["scout", "researcher", "worker"]) {
+        const defs = testApi.loadAgentDefaults(name)!;
+        assert.equal(defs.model, undefined);
+        assert.ok(!defs.tools?.includes("web_fetch"));
+      }
+      assert.ok(testApi.loadAgentDefaults("researcher")!.tools?.includes("fetch_content"));
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
@@ -2279,7 +2295,7 @@ describe("subagent interruption", () => {
     const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
       sentSurface = surface;
       sentText = text;
-    });
+    }, () => true);
 
     assert.deepEqual(result, { ok: true });
     assert.equal(sentSurface, "pane-1");
@@ -2292,7 +2308,7 @@ describe("subagent interruption", () => {
 
     const result = testApi.steerSubagent(running, "hi", () => {
       throw new Error("mux write failed");
-    });
+    }, () => true);
 
     assert.match(result.error, /Failed to deliver message/);
   });
@@ -2326,7 +2342,7 @@ describe("subagent interruption", () => {
         testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
           sentSurface = surface;
           sentText = text;
-        }),
+        }, () => true),
       );
 
       assert.equal(sentSurface, "pane-1");
@@ -2380,7 +2396,7 @@ describe("subagent interruption", () => {
       const result = withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
           throw new Error("mux write failed");
-        }),
+        }, () => true),
       );
 
       assert.match(result.content[0].text, /Failed to deliver message/);

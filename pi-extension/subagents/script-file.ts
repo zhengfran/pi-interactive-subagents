@@ -10,6 +10,13 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { supervisedCommand, type ProcessRun } from "./process-run.ts";
+
+export interface CommandScriptOptions {
+  scriptPath?: string;
+  scriptPreamble?: string;
+  processRun?: ProcessRun;
+}
 
 /**
  * Write `command` (optionally preceded by a preamble comment block) to a
@@ -19,7 +26,7 @@ import { dirname, join } from "node:path";
  */
 export function writeCommandScript(
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: CommandScriptOptions,
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -34,7 +41,8 @@ export function writeCommandScript(
   if (options?.scriptPreamble) {
     scriptParts.push(options.scriptPreamble.trimEnd());
   }
-  scriptParts.push(command);
+  if (options?.processRun) mkdirSync(dirname(options.processRun.receiptFile), { recursive: true });
+  scriptParts.push(options?.processRun ? supervisedCommand(command, options.processRun) : command);
 
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
