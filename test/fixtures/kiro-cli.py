@@ -14,7 +14,7 @@ if args[:3] == ["agent", "validate", "--path"]:
     json.loads(pathlib.Path(args[3]).read_text())
     sys.exit(0)
 assert args[:2] == ["chat", "--v2"]
-assert "--trust-tools=" in args
+assert "--trust-all-tools" in args and not any(arg.startswith("--trust-tools") for arg in args)
 assert "--no-interactive" not in args
 name = args[args.index("--agent") + 1]
 saved = pathlib.Path(".fake-kiro-session.json")

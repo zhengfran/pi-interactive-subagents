@@ -8,7 +8,7 @@ References: [Kiro 2.x reference](https://kiro.dev/docs/cli/2x-reference/), [agen
 
 ## Live evidence — 2026-09-28
 
-Three additional benign model prompts were explicitly authorized after earlier reconnaissance. No tools were requested, approvals answered, permissions bypassed, global configuration modified, or packages updated.
+Three additional benign model prompts were explicitly authorized after earlier reconnaissance. No tools were requested, approvals answered, global configuration modified, or packages updated. Those lifecycle runs predate the later switch to `--trust-all-tools`; the bypass flag is covered by command-construction and offline launch fixtures.
 
 1. **Initial native turn:** the prompt supplied a tagged token and asked Kiro to remember `COBALT`, then answer `KIRO_NATIVE_ONE`. The hook JSON contained:
    - `agentSpawn`: `hook_event_name`, `cwd`, `session_id`.
@@ -28,8 +28,8 @@ Mid-generation queued steering has deterministic fixture coverage, not a live mo
 - Hooks lock and atomically write state. Session identity is obtained from the owned native hooks, never by selecting a recent session from a directory.
 - Kiro Stop has no turn ID. Parent follow-ups are queued and serialized after the current correlated Stop. Overlapping native prompts fail explicitly rather than assigning an old response to a new turn.
 - A Stop receipt alone does not close the pane. Autonomous runs send `/quit` and await the supervised process exit, allowing native history to persist before a future resume. Interactive profiles remain open.
-- Missing hook/start acknowledgements fail after 30 seconds; graceful quit that never exits fails after 15 seconds. A provider/tool/permission wait after a valid prompt acknowledgement is not a task timeout.
-- Generated profiles have explicit tool sets, no auto-trusted tools, and no inherited MCP configuration. Their `resources` contain only cwd-local, regular (non-symlink) `AGENTS.md`/`CLAUDE.md` files. The installed 2.24.0 source reads relative `file://` resources against the workspace into custom-agent context and skips missing files. This resource wiring has fixture/source coverage only, not a live model probe. `--trust-tools=''` does not bypass native approval prompts. Pi-only capabilities and permission mappings that would broaden access fail closed.
+- Missing hook/start acknowledgements fail after 30 seconds; graceful quit that never exits fails after 15 seconds. A provider/tool wait after a valid prompt acknowledgement is not a task timeout.
+- Generated profiles have explicit tool sets and no inherited MCP configuration. Their `resources` contain only cwd-local, regular (non-symlink) `AGENTS.md`/`CLAUDE.md` files. The installed 2.24.0 source reads relative `file://` resources against the workspace into custom-agent context and skips missing files. This resource wiring has fixture/source coverage only, not a live model probe. The launch uses `--trust-all-tools`, which pre-approves the generated profile's explicit tool set without adding unavailable tools. Pi-only capabilities and permission mappings that would broaden access fail closed. This is not an OS sandbox; use native worker profiles only in trusted working directories.
 - Run-specific files isolate concurrent sessions in the same cwd. Profiles are removed only when their contents still match the generated file; human edits are preserved. Symlinked profile directories are refused.
 - Native session-ID rollover (for example, a compaction that changes identity), unsupported CLI versions, and ambiguous human input during autonomous operation fail closed. They are not silently treated as successful completion.
 

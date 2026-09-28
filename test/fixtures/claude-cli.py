@@ -8,8 +8,8 @@ import sys
 
 args = sys.argv[1:]
 assert "-p" not in args and "--print" not in args and "--output-format" not in args
-assert not any("dangerously" in arg for arg in args) and "--allowedTools" not in args
-assert args[args.index("--permission-mode") + 1] == "manual"
+assert "--dangerously-skip-permissions" in args and "--allowedTools" not in args
+assert args[args.index("--permission-mode") + 1] == "bypassPermissions"
 assert "--strict-mcp-config" in args and "--mcp-config" not in args
 assert args[args.index("--tools") + 1] == "Read"
 settings = json.loads(pathlib.Path(args[args.index("--settings") + 1]).read_text())

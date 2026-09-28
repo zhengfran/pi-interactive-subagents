@@ -113,10 +113,12 @@ export function claudeCommand(run: ClaudeRun, task: string, options: {
   tools: string; model?: string | null; thinking?: string | null;
   identity?: string | null; promptMode?: "append" | "replace" | null;
 }): string {
-  // No --allowedTools pre-approval and no bypass: approvals stay native/manual.
+  // Autonomous children cannot answer approval prompts. Bypass approvals for
+  // the explicit --tools allowlist only; unavailable tools stay unavailable.
   // --strict-mcp-config without --mcp-config loads zero MCP servers, including
   // inherited user/project/plugin configuration.
-  const args = ["claude", "--permission-mode", "manual", "--strict-mcp-config", "--tools", shellEscape(options.tools),
+  const args = ["claude", "--permission-mode", "bypassPermissions", "--dangerously-skip-permissions",
+    "--strict-mcp-config", "--tools", shellEscape(options.tools),
     "--settings", shellEscape(run.settingsFile)];
   if (options.model) args.push("--model", shellEscape(options.model));
   if (options.thinking) args.push("--effort", shellEscape(options.thinking));

@@ -42,7 +42,7 @@ describe("Kiro native V2 adapter", () => {
       { promptMode: "replace" }, { thinking: "off" }]) assert.throws(() => kiroTools("read", options));
   });
 
-  it("creates isolated profiles without global MCP or automatic tool trust", () => fixture(({ run }) => {
+  it("creates isolated profiles without global MCP and pre-approves the explicit tool set", () => fixture(({ run }) => {
     const profile = JSON.parse(readFileSync(run.profilePath, "utf8"));
     assert.deepEqual(profile.tools, ["fs_read"]);
     assert.deepEqual(profile.allowedTools, []);
@@ -50,8 +50,8 @@ describe("Kiro native V2 adapter", () => {
     assert.deepEqual(Object.keys(profile.hooks), ["agentSpawn", "userPromptSubmit", "stop"]);
     const command = kiroCommand(run, "task", { model: "native-model", thinking: "high" });
     assert.match(command, /kiro-cli chat --v2/);
-    assert.match(command, /--trust-tools=''/);
-    assert.doesNotMatch(command, /trust-all|no-interactive|stream-json|acp|--resume /);
+    assert.match(command, /--trust-all-tools/);
+    assert.doesNotMatch(command, /--trust-tools|no-interactive|stream-json|acp|--resume /);
     run.nativeSessionId = sessionId;
     assert.match(kiroCommand(run, "again"), new RegExp(`--resume-id '${sessionId}'`));
   }));
@@ -247,7 +247,7 @@ describe("bundled native worker profiles", () => {
         assert.ok(body.includes(line), `${name} is missing core instruction: ${line}`);
       }
       assert.match(body, /work autonomously/);
-      assert.match(body, /Keep native permission prompts for human approval/);
+      assert.match(body, /pre-approved without prompting/);
       assert.match(body, /report the blocker/);
     }
     assert.equal(read("claude-worker"), read("kiro-worker"), "native worker bodies should not drift apart");

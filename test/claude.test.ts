@@ -55,7 +55,7 @@ describe("native interactive Claude adapter", () => {
     assert.equal(claudeTools("read", { thinking: "high" }), "Read");
   });
 
-  it("launches/resumes the exact UUID in its cwd with manual permissions, no MCP and no pre-approval", async () => withDir((dir) => {
+  it("launches/resumes the exact UUID in its cwd with bypassed approvals and no MCP", async () => withDir((dir) => {
     const initial = claudeCommand(makeRun(dir, { id: "a" }), "benign", { tools: "Read" });
     const resumed = claudeCommand(makeRun(dir, { id: "b", resume: true }), "follow-up", { tools: "Read" });
     assert.match(initial, new RegExp(`--session-id '${session}' '\\[pi-subagent-turn:`));
@@ -63,8 +63,8 @@ describe("native interactive Claude adapter", () => {
     assert.doesNotMatch(resumed, /--session-id/);
     for (const command of [initial, resumed]) {
       assert.ok(command.startsWith(`cd '${dir}' && claude `));
-      assert.match(command, /--permission-mode manual --strict-mcp-config --tools 'Read' --settings /);
-      assert.doesNotMatch(command, /dangerously|bypass|allowedTools|--mcp-config|--print|-p |stream-json/);
+      assert.match(command, /--permission-mode bypassPermissions --dangerously-skip-permissions --strict-mcp-config --tools 'Read' --settings /);
+      assert.doesNotMatch(command, /--permission-mode manual|allowedTools|--mcp-config|--print|-p |stream-json/);
     }
     const replaced = claudeCommand(makeRun(dir, { id: "c" }), "x", { tools: "Read", identity: "ROLE", promptMode: "replace", thinking: "high", model: "sonnet" });
     assert.match(replaced, /--model 'sonnet' --effort 'high' --system-prompt 'ROLE' --session-id/);

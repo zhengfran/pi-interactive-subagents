@@ -152,7 +152,9 @@ export function cleanupKiroRun(run: KiroRun): void {
 }
 
 export function kiroCommand(run: KiroRun, task: string, options?: { model?: string | null; thinking?: string | null }): string {
-  const args = ["kiro-cli", "chat", "--v2", "--agent", shellEscape(run.profileName), "--trust-tools=''"];
+  // Autonomous children cannot answer approval prompts. The generated profile
+  // still limits which tools exist; this only trusts that explicit set.
+  const args = ["kiro-cli", "chat", "--v2", "--agent", shellEscape(run.profileName), "--trust-all-tools"];
   if (run.nativeSessionId) args.push("--resume-id", shellEscape(run.nativeSessionId));
   if (options?.model) args.push("--model", shellEscape(options.model));
   if (options?.thinking) args.push("--effort", shellEscape(options.thinking));
